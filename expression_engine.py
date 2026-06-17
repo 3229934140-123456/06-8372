@@ -326,6 +326,9 @@ class ConstantFolder:
         'max': max,
         'floor': _math.floor,
         'ceil': _math.ceil,
+        'if': lambda c, t, e: t if c > 0 else e,
+        'clamp': lambda x, lo, hi: max(lo, min(x, hi)),
+        'sign': lambda x: (1.0 if x > 0 else (-1.0 if x < 0 else 0.0)),
     }
 
     @classmethod
@@ -540,7 +543,8 @@ class CodeGenerator:
             instructions=self.instructions,
             variable_map=self.variable_map,
             constants=self.constants,
-            temp_count=self.temp_count
+            temp_count=self.temp_count,
+            required_variables=list(self.variable_map.keys())
         )
 
     def _collect_variables(self, node: ASTNode):
@@ -603,6 +607,7 @@ class CompiledExpression:
     variable_map: Dict[str, int]
     constants: List[float]
     temp_count: int
+    required_variables: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         self._fast_ops: List[int] = []
@@ -632,9 +637,19 @@ class CompiledExpression:
     def evaluate(self, variables: Optional[Dict[str, float]] = None) -> float:
         var_values = [0.0] * len(self.variable_map)
         if variables:
+            missing = []
             for name, idx in self.variable_map.items():
                 if name in variables:
                     var_values[idx] = variables[name]
+                else:
+                    missing.append(name)
+            if missing:
+                if len(missing) == 1:
+                    raise ValueError(f"Missing required variable: '{missing[0]}'")
+                raise ValueError(f"Missing required variables: {missing}")
+        elif self.variable_map:
+            missing = list(self.variable_map.keys())
+            raise ValueError(f"Missing required variables: {missing}")
         return self._eval_arr(var_values)
 
     def evaluate_arr(self, var_values: List[float]) -> float:
@@ -749,6 +764,21 @@ class TreeEvaluator:
         raise ValueError(f"Unknown node type: {node.node_type}")
 
 
+@dataclass
+class CompilationStages:
+    expression: str
+    required_variables: List[str]
+    defaults: Dict[str, float]
+    raw_ast: ASTNode
+    folded_ast: ASTNode
+    cse_temp_bindings: List[Tuple[str, ASTNode]]
+    cse_root: ASTNode
+    instructions: List[Instruction]
+    constants: List[float]
+    variable_map: Dict[str, int]
+    temp_count: int
+
+
 class ExpressionEngine:
     def __init__(self, expression: str, **default_variables):
         self.original_expression = expression
@@ -816,6 +846,21 @@ class ExpressionEngine:
         lines.append("=" * 70)
         return "\n".join(lines)
 
+    def compilation_stages(self) -> CompilationStages:
+        return CompilationStages(
+            expression=self.original_expression,
+            required_variables=list(self._sorted_vars),
+            defaults=dict(self.defaults),
+            raw_ast=self.raw_ast,
+            folded_ast=self.folded_ast,
+            cse_temp_bindings=[(f'__temp_{i}', b) for i, b in enumerate(self.temp_bindings)],
+            cse_root=self.optimized_root,
+            instructions=list(self.compiled.instructions),
+            constants=list(self.compiled.constants),
+            variable_map=dict(self.compiled.variable_map),
+            temp_count=self.compiled.temp_count,
+        )
+
     def set_defaults(self, **kwargs) -> 'ExpressionEngine':
         for k, v in kwargs.items():
             if k not in self.compiled.variable_map:
@@ -875,6 +920,15 @@ class ExpressionEngine:
             if node.op == BinaryOp.POW:
                 return f"({left} ** {right})"
         if node.node_type == NodeType.FUNCTION_CALL:
+            if node.func_name == 'if':
+                c, t, e = [self._ast_to_python(a) for a in node.args]
+                return f"(({t}) if ({c}) > 0 else ({e}))"
+            if node.func_name == 'clamp':
+                x, lo, hi = [self._ast_to_python(a) for a in node.args]
+                return f"max({lo}, min({x}, {hi}))"
+            if node.func_name == 'sign':
+                x = self._ast_to_python(node.args[0])
+                return f"(1 if ({x}) > 0 else (-1 if ({x}) < 0 else 0))"
             args = ", ".join(self._ast_to_python(a) for a in node.args)
             return f"{node.func_name}({args})"
         raise ValueError(f"Cannot convert node: {node.node_type}")
@@ -892,6 +946,9 @@ class ExpressionEngine:
                 lines.append(f"{fname} = _m.{fname}")
             elif fname in ('abs', 'min', 'max'):
                 lines.append(f"{fname} = _b.{fname}")
+            elif fname == 'sign':
+                lines.append("def _sign(x): return (1 if x > 0 else (-1 if x < 0 else 0))")
+                lines.append("sign = _sign")
 
         for i, binding in enumerate(self.temp_bindings):
             expr_str = self._ast_to_python(binding)
@@ -967,24 +1024,30 @@ class ExpressionEngine:
 
     def evaluate_columns(self, columns: Dict[str, List[float]]) -> List[float]:
         var_names = self._sorted_vars
-        missing = [n for n in var_names if n not in columns]
+        defaults = self.defaults
+        missing = [n for n in var_names if n not in columns and n not in defaults]
         if missing:
             if len(missing) == 1:
                 raise ValueError(f"Missing required column: '{missing[0]}'")
             raise ValueError(f"Missing required columns: {missing}")
-        lengths = {len(columns[n]) for n in var_names}
-        if len(lengths) != 1:
-            info = {n: len(columns[n]) for n in var_names}
-            raise ValueError(f"All column arrays must have the same length. Got: {info}")
-        defaults = self.defaults
-        N = lengths.pop()
+        lengths = set()
         for n in var_names:
-            if n not in columns and n in defaults:
-                columns[n] = [defaults[n]] * N
+            if n in columns:
+                lengths.add(len(columns[n]))
+        if len(lengths) != 1:
+            info = {n: len(columns[n]) for n in var_names if n in columns}
+            raise ValueError(f"All column arrays must have the same length. Got: {info}")
+        N = lengths.pop() if lengths else 0
+        col_data = {}
+        for n in var_names:
+            if n in columns:
+                col_data[n] = columns[n]
+            else:
+                col_data[n] = [defaults[n]] * N
         var_map = self.compiled.variable_map
         num_vars = len(var_names)
         indices = [var_map[n] for n in var_names]
-        col_arrays = [columns[n] for n in var_names]
+        col_arrays = [col_data[n] for n in var_names]
         compiled = self.compiled
         results = [0.0] * N
         for i in range(N):
@@ -1028,6 +1091,140 @@ class ExpressionEngine:
             else:
                 result.append(instr.opcode.name)
         return result
+
+    def evaluator(self) -> BatchEvaluator:
+        return BatchEvaluator(self.compiled, self._sorted_vars, self.defaults, self.compile_to_native())
+
+
+class BatchEvaluator:
+    __slots__ = ('_compiled', '_var_names', '_defaults', '_indices', '_num_vars', '_native_func', '_eval_arr')
+
+    def __init__(self, compiled: CompiledExpression, var_names: List[str], defaults: Dict[str, float], native_func: Optional[Callable] = None):
+        self._compiled = compiled
+        self._var_names = var_names
+        self._defaults = defaults
+        self._indices = [compiled.variable_map[n] for n in var_names]
+        self._num_vars = len(var_names)
+        self._native_func = native_func
+        self._eval_arr = compiled._eval_arr
+
+    def __call__(self, **variables) -> float:
+        missing = []
+        arr = [0.0] * self._num_vars
+        for name, idx in zip(self._var_names, self._indices):
+            if name in variables:
+                arr[idx] = float(variables[name])
+            elif name in self._defaults:
+                arr[idx] = float(self._defaults[name])
+            else:
+                missing.append(name)
+        if missing:
+            if len(missing) == 1:
+                raise ValueError(f"Missing required variable: '{missing[0]}'")
+            raise ValueError(f"Missing required variables: {missing}")
+        return self._eval_arr(arr)
+
+    def eval_dict_list(self, variable_list: List[Dict[str, float]]) -> List[float]:
+        var_names = self._var_names
+        defaults = self._defaults
+        indices = self._indices
+        num_vars = self._num_vars
+        eval_arr = self._eval_arr
+        results = []
+        append = results.append
+        for vd in variable_list:
+            missing = []
+            arr = [0.0] * num_vars
+            for name, idx in zip(var_names, indices):
+                if name in vd:
+                    arr[idx] = float(vd[name])
+                elif name in defaults:
+                    arr[idx] = float(defaults[name])
+                else:
+                    missing.append(name)
+            if missing:
+                if len(missing) == 1:
+                    raise ValueError(f"Missing required variable: '{missing[0]}'")
+                raise ValueError(f"Missing required variables: {missing}")
+            append(eval_arr(arr))
+        return results
+
+    def eval_columns(self, columns: Dict[str, List[float]]) -> List[float]:
+        var_names = self._var_names
+        defaults = self._defaults
+        missing = [n for n in var_names if n not in columns and n not in defaults]
+        if missing:
+            if len(missing) == 1:
+                raise ValueError(f"Missing required column: '{missing[0]}'")
+            raise ValueError(f"Missing required columns: {missing}")
+        lengths = set()
+        for n in var_names:
+            if n in columns:
+                lengths.add(len(columns[n]))
+        if len(lengths) != 1:
+            info = {n: len(columns[n]) for n in var_names if n in columns}
+            raise ValueError(f"All column arrays must have the same length. Got: {info}")
+        N = lengths.pop() if lengths else 0
+        col_data = {}
+        for n in var_names:
+            if n in columns:
+                col_data[n] = columns[n]
+            else:
+                col_data[n] = [defaults[n]] * N
+        indices = self._indices
+        num_vars = self._num_vars
+        eval_arr = self._eval_arr
+        col_arrays = [col_data[n] for n in var_names]
+        results = [0.0] * N
+        for i in range(N):
+            arr = [0.0] * num_vars
+            for j in range(num_vars):
+                arr[indices[j]] = float(col_arrays[j][i])
+            results[i] = eval_arr(arr)
+        return results
+
+    def eval_arrays(self, *arrays: List[float]) -> List[float]:
+        num_vars = self._num_vars
+        if len(arrays) != num_vars:
+            raise ValueError(f"Expected {num_vars} arrays (one per variable), got {len(arrays)}")
+        N = len(arrays[0])
+        for i, a in enumerate(arrays):
+            if len(a) != N:
+                raise ValueError(f"Array {i} has length {len(a)}, expected {N}")
+        indices = self._indices
+        eval_arr = self._eval_arr
+        results = [0.0] * N
+        for i in range(N):
+            arr = [0.0] * num_vars
+            for j in range(num_vars):
+                arr[indices[j]] = float(arrays[j][i])
+            results[i] = eval_arr(arr)
+        return results
+
+    def eval_native_dict_list(self, variable_list: List[Dict[str, float]]) -> List[float]:
+        if self._native_func is None:
+            raise ValueError("Native function not available")
+        var_names = self._var_names
+        defaults = self._defaults
+        func = self._native_func
+        results = []
+        append = results.append
+        for vd in variable_list:
+            missing = []
+            args = []
+            for n in var_names:
+                if n in vd:
+                    args.append(float(vd[n]))
+                elif n in defaults:
+                    args.append(float(defaults[n]))
+                else:
+                    missing.append(n)
+            if missing:
+                if len(missing) == 1:
+                    raise ValueError(f"Missing required variable: '{missing[0]}'")
+                raise ValueError(f"Missing required variables: {missing}")
+            append(func(*args))
+        return results
 
 
 def run_tests():
@@ -1097,7 +1294,62 @@ def run_tests():
     print(f"  floor(3.9) + ceil(2.1) + min(10,20) = {r} (期望 {expected})")
     print("✓ 新函数参与常量折叠正确")
 
-    print("\n--- 测试 8: 常量折叠 ---")
+    print("\n--- 测试 8: 条件函数 if ---")
+    engine = ExpressionEngine("if(x - 5, x, 0)")
+    v1 = {'x': 10.0}
+    v2 = {'x': 3.0}
+    r1_tree = engine.evaluate_tree(v1)
+    r1_vm = engine.evaluate(v1)
+    r1_native = engine.evaluate_native(v1)
+    r2_tree = engine.evaluate_tree(v2)
+    r2_vm = engine.evaluate(v2)
+    r2_native = engine.evaluate_native(v2)
+    assert abs(r1_tree - 10.0) < 1e-10
+    assert abs(r1_vm - 10.0) < 1e-10
+    assert abs(r1_native - 10.0) < 1e-10
+    assert abs(r2_tree - 0.0) < 1e-10
+    assert abs(r2_vm - 0.0) < 1e-10
+    assert abs(r2_native - 0.0) < 1e-10
+    print(f"  if(10-5, 10, 0) = {r1_vm} (x=10, cond>0, 应得10)")
+    print(f"  if(3-5, 3, 0) = {r2_vm} (x=3, cond<=0, 应得0)")
+    print("✓ if 函数在三种求值路径结果一致")
+
+    print("\n--- 测试 9: if 常量折叠 ---")
+    engine = ExpressionEngine("if(1, 100, 200) + if(-1, 300, 400)")
+    r = engine.evaluate()
+    assert abs(r - 500.0) < 1e-10
+    print(f"  if(1,100,200) + if(-1,300,400) = {r} (期望 500)")
+    print("✓ if 函数常量折叠正确")
+
+    print("\n--- 测试 10: clamp 函数 ---")
+    engine = ExpressionEngine("clamp(x, 0, 10)")
+    cases = [(-5, 0), (5, 5), (15, 10)]
+    for val, exp in cases:
+        v = {'x': float(val)}
+        r_tree = engine.evaluate_tree(v)
+        r_vm = engine.evaluate(v)
+        r_native = engine.evaluate_native(v)
+        assert abs(r_tree - exp) < 1e-10
+        assert abs(r_vm - exp) < 1e-10
+        assert abs(r_native - exp) < 1e-10
+    print(f"  clamp(-5,0,10)={engine.evaluate({'x':-5})}, clamp(5,0,10)={engine.evaluate({'x':5})}, clamp(15,0,10)={engine.evaluate({'x':15})}")
+    print("✓ clamp 函数在三种求值路径结果一致")
+
+    print("\n--- 测试 11: sign 函数 ---")
+    engine = ExpressionEngine("sign(x)")
+    cases = [(-7, -1), (0, 0), (3, 1)]
+    for val, exp in cases:
+        v = {'x': float(val)}
+        r_tree = engine.evaluate_tree(v)
+        r_vm = engine.evaluate(v)
+        r_native = engine.evaluate_native(v)
+        assert abs(r_tree - exp) < 1e-10
+        assert abs(r_vm - exp) < 1e-10
+        assert abs(r_native - exp) < 1e-10
+    print(f"  sign(-7)={engine.evaluate({'x':-7})}, sign(0)={engine.evaluate({'x':0})}, sign(3)={engine.evaluate({'x':3})}")
+    print("✓ sign 函数在三种求值路径结果一致")
+
+    print("\n--- 测试 12: 常量折叠 ---")
     engine = ExpressionEngine("(2 + 3) * (4 + 5) + x")
     raw_result = engine.evaluate_tree({'x': 1})
     opt_result = engine.evaluate({'x': 1})
@@ -1108,7 +1360,7 @@ def run_tests():
     assert abs(raw_result - opt_result) < 1e-10
     print("✓ 常量折叠正确")
 
-    print("\n--- 测试 9: 公共子表达式消除 ---")
+    print("\n--- 测试 13: 公共子表达式消除 ---")
     expr = "sin(x) * sin(x) + cos(x) * cos(x) + sin(x) * cos(x)"
     engine = ExpressionEngine(expr)
     result = engine.evaluate({'x': 0.5})
@@ -1116,7 +1368,7 @@ def run_tests():
     assert abs(result - expected) < 1e-10
     print(f"✓ CSE 正确, 结果 = {result}")
 
-    print("\n--- 测试 10: 一元负号和优先级 ---")
+    print("\n--- 测试 14: 一元负号和优先级 ---")
     engine = ExpressionEngine("-x^2 + (-y)^2")
     result = engine.evaluate({'x': 3, 'y': 4})
     expected = -9 + 16
@@ -1124,21 +1376,21 @@ def run_tests():
     assert abs(result - expected) < 1e-10
     print("✓ 一元运算符正确")
 
-    print("\n--- 测试 11: 函数调用 ---")
+    print("\n--- 测试 15: 函数调用 ---")
     engine = ExpressionEngine("sqrt(x^2 + y^2)")
     result = engine.evaluate({'x': 3, 'y': 4})
     print(f"  sqrt(3^2 + 4^2) = {result} (期望 5)")
     assert abs(result - 5.0) < 1e-10
     print("✓ 函数调用正确")
 
-    print("\n--- 测试 12: 变量列表 ---")
+    print("\n--- 测试 16: 变量列表 ---")
     engine = ExpressionEngine("a + b * c - d / e")
     vars_list = engine.variables()
     print(f"  变量: {vars_list}")
     assert vars_list == ['a', 'b', 'c', 'd', 'e']
     print("✓ 变量列表正确")
 
-    print("\n--- 测试 13: 原生函数编译正确性 ---")
+    print("\n--- 测试 17: 原生函数编译正确性 ---")
     engine = ExpressionEngine("sin(x) * cos(x) + sqrt(x^2 + y^2) + min(x, y)")
     v = {'x': 1.5, 'y': 2.5}
     r_tree = engine.evaluate_tree(v)
@@ -1151,7 +1403,7 @@ def run_tests():
     assert abs(r_tree - r_native) < 1e-10
     print("✓ 三种求值方式结果一致")
 
-    print("\n--- 测试 14: 按列批量求值 ---")
+    print("\n--- 测试 18: 按列批量求值 ---")
     engine = ExpressionEngine("x + y * 2")
     cols = {'x': [1.0, 2.0, 3.0, 4.0], 'y': [10.0, 20.0, 30.0, 40.0]}
     results = engine.evaluate_columns(cols)
@@ -1161,17 +1413,34 @@ def run_tests():
     print(f"  结果={results}")
     print("✓ 按列批量求值顺序正确、结果正确")
 
-    print("\n--- 测试 15: 按列批量求值缺列时报错 ---")
+    print("\n--- 测试 19: 按列批量求值缺列时报错 ---")
     try:
         engine.evaluate_columns({'x': [1.0, 2.0]})
         raise AssertionError("应该报错缺y列")
     except ValueError as e:
         print(f"✓ 缺列时报错正确: {e}")
 
-    print("\n--- 测试 16: 编译报告可视化 ---")
+    print("\n--- 测试 20: evaluate_columns 默认值生效 ---")
+    engine = ExpressionEngine("x + y * 2", y=5)
+    results = engine.evaluate_columns({'x': [1.0, 2.0, 3.0]})
+    expected = [1 + 5*2, 2 + 5*2, 3 + 5*2]
+    assert all(abs(a - b) < 1e-10 for a, b in zip(results, expected))
+    print(f"  x列=[1,2,3], y默认=5, 结果={results}")
+    print("✓ evaluate_columns 默认值正确生效")
+
+    print("\n--- 测试 21: CompiledExpression 缺变量报错 ---")
+    engine = ExpressionEngine("a + b")
+    compiled = engine.compiled
+    try:
+        compiled.evaluate({'a': 1.0})
+        raise AssertionError("应该报错缺变量b")
+    except ValueError as e:
+        assert "'b'" in str(e)
+        print(f"✓ CompiledExpression 缺变量报错正确: {e}")
+
+    print("\n--- 测试 22: 编译报告可视化 ---")
     engine = ExpressionEngine("(1 + 2) * x + sin(x) * sin(x) + min(x, y)")
     report = engine.compilation_report()
-    print(report)
     assert "原始 AST 树" in report
     assert "常量折叠后 AST 树" in report
     assert "公共子表达式" in report
@@ -1179,7 +1448,103 @@ def run_tests():
     assert "__temp_" in report
     print("✓ 编译报告包含全部 5 个阶段")
 
-    print("\n--- 测试 17: 性能对比 ---")
+    print("\n--- 测试 23: 编译结果结构化导出 ---")
+    engine = ExpressionEngine("(1 + 2) * x + sin(x)", x=0)
+    stages = engine.compilation_stages()
+    assert stages.expression == "(1 + 2) * x + sin(x)"
+    assert 'x' in stages.required_variables
+    assert 'x' in stages.defaults
+    assert stages.raw_ast is not None
+    assert stages.folded_ast is not None
+    assert len(stages.instructions) > 0
+    assert len(stages.constants) > 0
+    assert isinstance(stages.variable_map, dict)
+    assert isinstance(stages.cse_temp_bindings, list)
+    assert stages.temp_count >= 0
+    print(f"  表达式: {stages.expression}")
+    print(f"  变量: {stages.required_variables}")
+    print(f"  默认值: {stages.defaults}")
+    print(f"  指令数: {len(stages.instructions)}")
+    print(f"  常量池: {stages.constants}")
+    print("✓ CompilationStages 结构化导出正确")
+
+    print("\n--- 测试 24: BatchEvaluator 单值调用 ---")
+    engine = ExpressionEngine("x + y", y=10)
+    ev = engine.evaluator()
+    r = ev(x=5)
+    assert abs(r - 15.0) < 1e-10
+    r2 = ev(x=5, y=20)
+    assert abs(r2 - 25.0) < 1e-10
+    print(f"  ev(x=5)={r}, ev(x=5,y=20)={r2}")
+    print("✓ BatchEvaluator __call__ 正确")
+
+    print("\n--- 测试 25: BatchEvaluator 缺变量报错 ---")
+    try:
+        ev(x=5)
+    except ValueError:
+        pass
+    engine2 = ExpressionEngine("x + y")
+    ev2 = engine2.evaluator()
+    try:
+        ev2(x=5)
+        raise AssertionError("应该报错缺变量y")
+    except ValueError as e:
+        assert "'y'" in str(e)
+        print(f"✓ BatchEvaluator 缺变量报错正确: {e}")
+
+    print("\n--- 测试 26: BatchEvaluator eval_dict_list ---")
+    engine = ExpressionEngine("x + y")
+    ev = engine.evaluator()
+    data = [{'x': 1, 'y': 2}, {'x': 3, 'y': 4}, {'x': 5, 'y': 6}]
+    results = ev.eval_dict_list(data)
+    assert results == [3.0, 7.0, 11.0]
+    print(f"  结果={results}")
+    print("✓ BatchEvaluator eval_dict_list 正确")
+
+    print("\n--- 测试 27: BatchEvaluator eval_columns ---")
+    engine = ExpressionEngine("x + y", y=5)
+    ev = engine.evaluator()
+    results = ev.eval_columns({'x': [1.0, 2.0, 3.0]})
+    assert results == [6.0, 7.0, 8.0]
+    print(f"  x列=[1,2,3], y默认=5, 结果={results}")
+    print("✓ BatchEvaluator eval_columns 正确（含默认值）")
+
+    print("\n--- 测试 28: BatchEvaluator eval_arrays ---")
+    engine = ExpressionEngine("x + y")
+    ev = engine.evaluator()
+    results = ev.eval_arrays([1.0, 2.0, 3.0], [10.0, 20.0, 30.0])
+    assert results == [11.0, 22.0, 33.0]
+    print(f"  x=[1,2,3], y=[10,20,30], 结果={results}")
+    print("✓ BatchEvaluator eval_arrays 正确")
+
+    print("\n--- 测试 29: BatchEvaluator eval_native_dict_list ---")
+    engine = ExpressionEngine("x * y + sign(x)")
+    ev = engine.evaluator()
+    data = [{'x': 2, 'y': 3}, {'x': -1, 'y': 5}, {'x': 0, 'y': 7}]
+    results_vm = ev.eval_dict_list(data)
+    results_native = ev.eval_native_dict_list(data)
+    assert all(abs(a - b) < 1e-10 for a, b in zip(results_vm, results_native))
+    print(f"  VM结果={results_vm}, 原生结果={results_native}")
+    print("✓ BatchEvaluator eval_native_dict_list 与 VM 结果一致")
+
+    print("\n--- 测试 30: 复杂条件表达式五路径一致 ---")
+    engine = ExpressionEngine("if(x - 3, clamp(x, 0, 10), -1) + sign(y)")
+    test_vals = [
+        {'x': 5, 'y': 2},
+        {'x': 1, 'y': -4},
+        {'x': 15, 'y': 0},
+        {'x': -2, 'y': 0.5},
+    ]
+    for v in test_vals:
+        r_tree = engine.evaluate_tree(v)
+        r_vm = engine.evaluate(v)
+        r_native = engine.evaluate_native(v)
+        assert abs(r_tree - r_vm) < 1e-10, f"tree={r_tree} vm={r_vm} vars={v}"
+        assert abs(r_tree - r_native) < 1e-10, f"tree={r_tree} native={r_native} vars={v}"
+    print(f"  {len(test_vals)} 组变量全部通过")
+    print("✓ if+clamp+sign 复合表达式在三条路径结果一致")
+
+    print("\n--- 测试 31: 性能对比 ---")
     expr_complex = ("(x + y) * (x + y) + sin(x + y) * cos(x + y) + "
                    "sqrt(x + y + 1) * log(x + y + 2) + exp(x + y) + min(x, y) + floor(x)")
     engine = ExpressionEngine(expr_complex)
@@ -1204,13 +1569,20 @@ def run_tests():
     native_results = engine.evaluate_batch_native(test_data)
     t_native = time.time() - t0
 
+    t0 = time.time()
+    ev = engine.evaluator()
+    evaluator_results = ev.eval_dict_list(test_data)
+    t_evaluator = time.time() - t0
+
     match1 = all(abs(a - b) < 1e-10 for a, b in zip(tree_results, compiled_results))
     match2 = all(abs(a - b) < 1e-10 for a, b in zip(tree_results, native_results))
+    match3 = all(abs(a - b) < 1e-10 for a, b in zip(tree_results, evaluator_results))
     print(f"  原始树遍历:          {t_tree:.4f} 秒")
     print(f"  栈式VM线性求值:     {t_compiled:.4f} 秒  (vs树遍历 {t_tree/t_compiled:.2f}x)")
     print(f"  原生Python函数编译: {t_native:.4f} 秒  (vs树遍历 {t_tree/t_native:.2f}x)")
-    print(f"  结果一致: {'✓' if match1 and match2 else '✗'}")
-    assert match1 and match2
+    print(f"  BatchEvaluator:     {t_evaluator:.4f} 秒  (vs树遍历 {t_tree/t_evaluator:.2f}x)")
+    print(f"  结果一致: {'✓' if match1 and match2 and match3 else '✗'}")
+    assert match1 and match2 and match3
 
     print("\n" + "=" * 70)
     print("所有测试通过!")
