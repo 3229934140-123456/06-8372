@@ -175,6 +175,53 @@ class ASTNode:
     def operand(self, val: 'ASTNode'):
         self.left = val
 
+    def format(self) -> str:
+        if self.node_type == NodeType.CONSTANT:
+            v = self.value
+            if float(v).is_integer():
+                return str(int(v))
+            return repr(v)
+        if self.node_type == NodeType.VARIABLE:
+            return str(self.value)
+        if self.node_type == NodeType.UNARY_OP:
+            inner = self.operand.format()
+            if self.operand.node_type in (NodeType.BINARY_OP, NodeType.UNARY_OP):
+                inner = f"({inner})"
+            if self.op == UnaryOp.NEGATE:
+                return f"-{inner}"
+            return f"{self.op}{inner}"
+        if self.node_type == NodeType.BINARY_OP:
+            left = self.left.format()
+            right = self.right.format()
+            if self.left.node_type == NodeType.BINARY_OP:
+                left = f"({left})"
+            if self.right.node_type in (NodeType.BINARY_OP, NodeType.UNARY_OP):
+                right = f"({right})"
+            return f"{left} {self.op.value} {right}"
+        if self.node_type == NodeType.FUNCTION_CALL:
+            args = ", ".join(a.format() for a in self.args)
+            return f"{self.func_name}({args})"
+        return f"<{self.node_type.name}>"
+
+    def to_tree_lines(self, prefix: str = "", is_last: bool = True) -> List[str]:
+        lines: List[str] = []
+        connector = "└── " if is_last else "├── "
+        lines.append(prefix + connector + self.format())
+        child_prefix = prefix + ("    " if is_last else "│   ")
+        children: List[ASTNode] = []
+        if self.node_type == NodeType.UNARY_OP:
+            children = [self.operand]
+        elif self.node_type == NodeType.BINARY_OP:
+            children = [self.left, self.right]
+        elif self.node_type == NodeType.FUNCTION_CALL:
+            children = list(self.args)
+        for i, child in enumerate(children):
+            lines.extend(child.to_tree_lines(child_prefix, i == len(children) - 1))
+        return lines
+
+    def to_tree_str(self) -> str:
+        return "\n".join(self.to_tree_lines("", True))
+
 
 class Parser:
     def __init__(self, tokens: List[Token]):
@@ -266,14 +313,19 @@ class Parser:
 
 
 class ConstantFolder:
+    _math = __import__('math')
     BUILTIN_FUNCS: Dict[str, Callable] = {
-        'sin': __import__('math').sin,
-        'cos': __import__('math').cos,
-        'tan': __import__('math').tan,
-        'sqrt': __import__('math').sqrt,
-        'exp': __import__('math').exp,
-        'log': __import__('math').log,
+        'sin': _math.sin,
+        'cos': _math.cos,
+        'tan': _math.tan,
+        'sqrt': _math.sqrt,
+        'exp': _math.exp,
+        'log': _math.log,
         'abs': abs,
+        'min': min,
+        'max': max,
+        'floor': _math.floor,
+        'ceil': _math.ceil,
     }
 
     @classmethod
@@ -698,17 +750,98 @@ class TreeEvaluator:
 
 
 class ExpressionEngine:
-    def __init__(self, expression: str):
+    def __init__(self, expression: str, **default_variables):
         self.original_expression = expression
         tokens = Tokenizer(expression).tokenize()
         self.raw_ast = Parser(tokens).parse()
-        folded_ast = ConstantFolder.fold(self._clone_ast(self.raw_ast))
-        self.cse_result = CSE().eliminate(folded_ast)
+        self.folded_ast = ConstantFolder.fold(self._clone_ast(self.raw_ast))
+        self.cse_result = CSE().eliminate(self._clone_ast(self.folded_ast))
         self.optimized_root = self.cse_result.root
         self.temp_bindings = self.cse_result.temp_bindings
         self.compiled = CodeGenerator().generate(self.cse_result)
         self._native_func = None
         self._sorted_vars = self.variables()
+        self.defaults: Dict[str, float] = {}
+        self.set_defaults(**default_variables)
+
+    def compilation_report(self) -> str:
+        lines = []
+        lines.append("=" * 70)
+        lines.append("编译报告")
+        lines.append("=" * 70)
+        lines.append(f"原始表达式: {self.original_expression}")
+        lines.append(f"变量列表: {self._sorted_vars}")
+        if self.defaults:
+            lines.append(f"默认值: {self.defaults}")
+
+        lines.append("")
+        lines.append("--- [阶段 1] 原始 AST 树 ---")
+        lines.append("")
+        lines.append(self.raw_ast.to_tree_str())
+
+        lines.append("")
+        lines.append("--- [阶段 2] 常量折叠后 AST 树 ---")
+        lines.append("")
+        folded_str = self.folded_ast.to_tree_str()
+        if folded_str == self.raw_ast.to_tree_str():
+            lines.append("（无变化，表达式中没有可折叠的全常量子树）")
+        else:
+            lines.append(folded_str)
+
+        lines.append("")
+        lines.append("--- [阶段 3] 公共子表达式（CSE）临时变量绑定 ---")
+        lines.append("")
+        if not self.temp_bindings:
+            lines.append("（无公共子表达式）")
+        else:
+            for i, binding in enumerate(self.temp_bindings):
+                lines.append(f"  __temp_{i} = {binding.format()}")
+
+        lines.append("")
+        lines.append("--- [阶段 4] CSE 后主表达式 ---")
+        lines.append("")
+        lines.append(f"  => {self.optimized_root.format()}")
+
+        lines.append("")
+        lines.append("--- [阶段 5] 最终栈式指令序列 ---")
+        lines.append("")
+        lines.append(f"  常量池: {self.compiled.constants}")
+        lines.append(f"  变量槽位: {dict(self.compiled.variable_map)}")
+        lines.append(f"  临时变量数: {self.compiled.temp_count}")
+        lines.append("")
+        for i, instr in enumerate(self.instructions()):
+            lines.append(f"  {i:3d}: {instr}")
+
+        lines.append("")
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+    def set_defaults(self, **kwargs) -> 'ExpressionEngine':
+        for k, v in kwargs.items():
+            if k not in self.compiled.variable_map:
+                raise ValueError(f"Unknown variable '{k}' for expression '{self.original_expression}'")
+            self.defaults[k] = float(v)
+        self._native_func = None
+        return self
+
+    def _resolve_variables(self, variables: Optional[Dict[str, float]]) -> Dict[str, float]:
+        required = self._sorted_vars
+        if variables is None:
+            variables = {}
+        resolved: Dict[str, float] = {}
+        missing = []
+        for name in required:
+            if name in variables:
+                resolved[name] = float(variables[name])
+            elif name in self.defaults:
+                resolved[name] = float(self.defaults[name])
+            else:
+                missing.append(name)
+        if missing:
+            if len(missing) == 1:
+                raise ValueError(f"Missing required variable: '{missing[0]}'")
+            raise ValueError(f"Missing required variables: {missing}")
+        return resolved
 
     def _clone_ast(self, node: ASTNode) -> ASTNode:
         new_node = ASTNode(node_type=node.node_type, value=node.value, op=node.op, func_name=node.func_name)
@@ -755,10 +888,10 @@ class ExpressionEngine:
 
         lines = ["import math as _m", "import builtins as _b"]
         for fname in ConstantFolder.BUILTIN_FUNCS:
-            if fname in ('sin', 'cos', 'tan', 'sqrt', 'exp', 'log'):
+            if fname in ('sin', 'cos', 'tan', 'sqrt', 'exp', 'log', 'floor', 'ceil'):
                 lines.append(f"{fname} = _m.{fname}")
-            elif fname == 'abs':
-                lines.append("abs = _b.abs")
+            elif fname in ('abs', 'min', 'max'):
+                lines.append(f"{fname} = _b.{fname}")
 
         for i, binding in enumerate(self.temp_bindings):
             expr_str = self._ast_to_python(binding)
@@ -775,44 +908,114 @@ class ExpressionEngine:
         self._native_func = namespace['_native_func']
         return self._native_func
 
-    def evaluate_native(self, variables: Dict[str, float]) -> float:
+    def evaluate_native(self, variables: Optional[Dict[str, float]] = None) -> float:
+        resolved = self._resolve_variables(variables)
         func = self.compile_to_native()
-        args = [variables[name] for name in self._sorted_vars]
-        return func(*args)
+        return func(*(resolved[n] for n in self._sorted_vars))
 
     def evaluate_tree(self, variables: Optional[Dict[str, float]] = None) -> float:
-        return TreeEvaluator.evaluate(self.raw_ast, variables)
+        resolved = self._resolve_variables(variables)
+        return TreeEvaluator.evaluate(self.raw_ast, resolved)
 
     def evaluate_optimized_tree(self, variables: Optional[Dict[str, float]] = None) -> float:
-        if variables is None:
-            variables = {}
+        resolved = self._resolve_variables(variables)
         temp_values = {}
         for i, binding in enumerate(self.temp_bindings):
-            temp_values[f'__temp_{i}'] = TreeEvaluator._eval(binding, {**variables, **temp_values})
-        return TreeEvaluator._eval(self.optimized_root, {**variables, **temp_values})
+            temp_values[f'__temp_{i}'] = TreeEvaluator._eval(binding, {**resolved, **temp_values})
+        return TreeEvaluator._eval(self.optimized_root, {**resolved, **temp_values})
 
     def evaluate(self, variables: Optional[Dict[str, float]] = None) -> float:
-        return self.compiled.evaluate(variables)
+        resolved = self._resolve_variables(variables)
+        var_map = self.compiled.variable_map
+        arr = [0.0] * len(var_map)
+        for name, idx in var_map.items():
+            arr[idx] = resolved[name]
+        return self.compiled.evaluate_arr(arr)
+
+    def _build_var_array(self, resolved: Dict[str, float]) -> List[float]:
+        var_map = self.compiled.variable_map
+        arr = [0.0] * len(var_map)
+        for name, idx in var_map.items():
+            arr[idx] = resolved[name]
+        return arr
 
     def evaluate_batch(self, variable_list: List[Dict[str, float]]) -> List[float]:
         var_names = self._sorted_vars
         var_map = self.compiled.variable_map
-        indices = [var_map[n] for n in var_names]
         num_vars = len(var_names)
+        indices = [var_map[n] for n in var_names]
+        defaults = self.defaults
         compiled = self.compiled
         results = []
         append = results.append
         for vars_dict in variable_list:
+            missing = []
             arr = [0.0] * num_vars
             for name, idx in zip(var_names, indices):
-                arr[idx] = vars_dict[name]
+                if name in vars_dict:
+                    arr[idx] = float(vars_dict[name])
+                elif name in defaults:
+                    arr[idx] = float(defaults[name])
+                else:
+                    missing.append(name)
+            if missing:
+                if len(missing) == 1:
+                    raise ValueError(f"Missing required variable: '{missing[0]}'")
+                raise ValueError(f"Missing required variables: {missing}")
             append(compiled.evaluate_arr(arr))
+        return results
+
+    def evaluate_columns(self, columns: Dict[str, List[float]]) -> List[float]:
+        var_names = self._sorted_vars
+        missing = [n for n in var_names if n not in columns]
+        if missing:
+            if len(missing) == 1:
+                raise ValueError(f"Missing required column: '{missing[0]}'")
+            raise ValueError(f"Missing required columns: {missing}")
+        lengths = {len(columns[n]) for n in var_names}
+        if len(lengths) != 1:
+            info = {n: len(columns[n]) for n in var_names}
+            raise ValueError(f"All column arrays must have the same length. Got: {info}")
+        defaults = self.defaults
+        N = lengths.pop()
+        for n in var_names:
+            if n not in columns and n in defaults:
+                columns[n] = [defaults[n]] * N
+        var_map = self.compiled.variable_map
+        num_vars = len(var_names)
+        indices = [var_map[n] for n in var_names]
+        col_arrays = [columns[n] for n in var_names]
+        compiled = self.compiled
+        results = [0.0] * N
+        for i in range(N):
+            arr = [0.0] * num_vars
+            for j in range(num_vars):
+                arr[indices[j]] = float(col_arrays[j][i])
+            results[i] = compiled.evaluate_arr(arr)
         return results
 
     def evaluate_batch_native(self, variable_list: List[Dict[str, float]]) -> List[float]:
         func = self.compile_to_native()
         var_names = self._sorted_vars
-        return [func(*(v[n] for n in var_names)) for v in variable_list]
+        defaults = self.defaults
+        results = []
+        append = results.append
+        for v in variable_list:
+            missing = []
+            args = []
+            for n in var_names:
+                if n in v:
+                    args.append(float(v[n]))
+                elif n in defaults:
+                    args.append(float(defaults[n]))
+                else:
+                    missing.append(n)
+            if missing:
+                if len(missing) == 1:
+                    raise ValueError(f"Missing required variable: '{missing[0]}'")
+                raise ValueError(f"Missing required variables: {missing}")
+            append(func(*args))
+        return results
 
     def variables(self) -> List[str]:
         return sorted(self.compiled.variable_map.keys())
@@ -828,11 +1031,12 @@ class ExpressionEngine:
 
 
 def run_tests():
+    import math as _m
     print("=" * 70)
     print("表达式树编译与求值优化引擎 - 测试套件")
     print("=" * 70)
 
-    print("\n--- 测试 1: 基本表达式求值 ---")
+    print("\n--- 测试 1: 纯常量表达式求值 ---")
     engine = ExpressionEngine("2 + 3 * 4")
     assert abs(engine.evaluate() - 14.0) < 1e-10
     print("✓ 2 + 3 * 4 = 14")
@@ -843,7 +1047,57 @@ def run_tests():
     assert abs(result - 11.0) < 1e-10
     print(f"✓ x + y * 2  (x=5, y=3) = {result}")
 
-    print("\n--- 测试 3: 常量折叠 ---")
+    print("\n--- 测试 3: 严格变量检查（缺变量报错） ---")
+    engine = ExpressionEngine("x + y")
+    try:
+        engine.evaluate({'x': 1})
+        raise AssertionError("应该报错缺变量y")
+    except ValueError as e:
+        assert "'y'" in str(e)
+        print(f"✓ 缺变量时报错正确: {e}")
+
+    print("\n--- 测试 4: 用户主动设置默认值 ---")
+    engine = ExpressionEngine("x + y", y=10)
+    r1 = engine.evaluate({'x': 5})
+    assert abs(r1 - 15.0) < 1e-10
+    r2 = engine.evaluate({'x': 5, 'y': 20})
+    assert abs(r2 - 25.0) < 1e-10
+    engine.set_defaults(x=100)
+    r3 = engine.evaluate()
+    assert abs(r3 - 110.0) < 1e-10
+    print(f"✓ 默认值工作: x+y(x=5,默认y=10)={r1}; x+y(x=5,y=20)={r2}; 全默认(x=100,y=10)={r3}")
+
+    print("\n--- 测试 5: 设置不存在变量的默认值时报错 ---")
+    try:
+        ExpressionEngine("x + y", z=1)
+        raise AssertionError("应该报错z不存在")
+    except ValueError as e:
+        assert "'z'" in str(e)
+        print(f"✓ 设置不存在变量默认值时报错正确: {e}")
+
+    print("\n--- 测试 6: 新增函数 min/max/floor/ceil ---")
+    engine = ExpressionEngine("min(a, b) + max(a, b) + floor(x) + ceil(y)")
+    v = {'a': 2.3, 'b': 5.7, 'x': 3.7, 'y': 3.1}
+    r_tree = engine.evaluate_tree(v)
+    r_vm = engine.evaluate(v)
+    r_native = engine.evaluate_native(v)
+    expected = min(2.3, 5.7) + max(2.3, 5.7) + _m.floor(3.7) + _m.ceil(3.1)
+    assert abs(r_tree - expected) < 1e-10
+    assert abs(r_vm - expected) < 1e-10
+    assert abs(r_native - expected) < 1e-10
+    print(f"  min(2.3,5.7)={min(2.3,5.7)}, max(2.3,5.7)={max(2.3,5.7)}, floor(3.7)={_m.floor(3.7)}, ceil(3.1)={_m.ceil(3.1)}")
+    print(f"  树遍历={r_tree}, VM={r_vm}, 原生={r_native}, 期望={expected}")
+    print("✓ min/max/floor/ceil 在三种求值路径结果一致")
+
+    print("\n--- 测试 7: 新函数的常量折叠 ---")
+    engine = ExpressionEngine("floor(3.9) + ceil(2.1) + min(10, 20)")
+    r = engine.evaluate()
+    expected = 3 + 3 + 10
+    assert abs(r - expected) < 1e-10
+    print(f"  floor(3.9) + ceil(2.1) + min(10,20) = {r} (期望 {expected})")
+    print("✓ 新函数参与常量折叠正确")
+
+    print("\n--- 测试 8: 常量折叠 ---")
     engine = ExpressionEngine("(2 + 3) * (4 + 5) + x")
     raw_result = engine.evaluate_tree({'x': 1})
     opt_result = engine.evaluate({'x': 1})
@@ -854,20 +1108,15 @@ def run_tests():
     assert abs(raw_result - opt_result) < 1e-10
     print("✓ 常量折叠正确")
 
-    print("\n--- 测试 4: 公共子表达式消除 ---")
+    print("\n--- 测试 9: 公共子表达式消除 ---")
     expr = "sin(x) * sin(x) + cos(x) * cos(x) + sin(x) * cos(x)"
     engine = ExpressionEngine(expr)
     result = engine.evaluate({'x': 0.5})
-    import math
-    expected = math.sin(0.5)**2 + math.cos(0.5)**2 + math.sin(0.5) * math.cos(0.5)
-    print(f"  表达式: {expr}")
-    print(f"  指令序列:")
-    for i, instr in enumerate(engine.instructions()):
-        print(f"    {i:3d}: {instr}")
+    expected = _m.sin(0.5)**2 + _m.cos(0.5)**2 + _m.sin(0.5) * _m.cos(0.5)
     assert abs(result - expected) < 1e-10
     print(f"✓ CSE 正确, 结果 = {result}")
 
-    print("\n--- 测试 5: 一元负号和优先级 ---")
+    print("\n--- 测试 10: 一元负号和优先级 ---")
     engine = ExpressionEngine("-x^2 + (-y)^2")
     result = engine.evaluate({'x': 3, 'y': 4})
     expected = -9 + 16
@@ -875,22 +1124,22 @@ def run_tests():
     assert abs(result - expected) < 1e-10
     print("✓ 一元运算符正确")
 
-    print("\n--- 测试 6: 函数调用 ---")
+    print("\n--- 测试 11: 函数调用 ---")
     engine = ExpressionEngine("sqrt(x^2 + y^2)")
     result = engine.evaluate({'x': 3, 'y': 4})
     print(f"  sqrt(3^2 + 4^2) = {result} (期望 5)")
     assert abs(result - 5.0) < 1e-10
     print("✓ 函数调用正确")
 
-    print("\n--- 测试 7: 变量列表 ---")
+    print("\n--- 测试 12: 变量列表 ---")
     engine = ExpressionEngine("a + b * c - d / e")
     vars_list = engine.variables()
     print(f"  变量: {vars_list}")
     assert vars_list == ['a', 'b', 'c', 'd', 'e']
     print("✓ 变量列表正确")
 
-    print("\n--- 测试 8: 原生函数编译正确性 ---")
-    engine = ExpressionEngine("sin(x) * cos(x) + sqrt(x^2 + y^2)")
+    print("\n--- 测试 13: 原生函数编译正确性 ---")
+    engine = ExpressionEngine("sin(x) * cos(x) + sqrt(x^2 + y^2) + min(x, y)")
     v = {'x': 1.5, 'y': 2.5}
     r_tree = engine.evaluate_tree(v)
     r_compiled = engine.evaluate(v)
@@ -902,9 +1151,37 @@ def run_tests():
     assert abs(r_tree - r_native) < 1e-10
     print("✓ 三种求值方式结果一致")
 
-    print("\n--- 测试 9: 性能对比 ---")
+    print("\n--- 测试 14: 按列批量求值 ---")
+    engine = ExpressionEngine("x + y * 2")
+    cols = {'x': [1.0, 2.0, 3.0, 4.0], 'y': [10.0, 20.0, 30.0, 40.0]}
+    results = engine.evaluate_columns(cols)
+    expected = [1 + 10*2, 2 + 20*2, 3 + 30*2, 4 + 40*2]
+    assert all(abs(a - b) < 1e-10 for a, b in zip(results, expected))
+    print(f"  x列={cols['x']}, y列={cols['y']}")
+    print(f"  结果={results}")
+    print("✓ 按列批量求值顺序正确、结果正确")
+
+    print("\n--- 测试 15: 按列批量求值缺列时报错 ---")
+    try:
+        engine.evaluate_columns({'x': [1.0, 2.0]})
+        raise AssertionError("应该报错缺y列")
+    except ValueError as e:
+        print(f"✓ 缺列时报错正确: {e}")
+
+    print("\n--- 测试 16: 编译报告可视化 ---")
+    engine = ExpressionEngine("(1 + 2) * x + sin(x) * sin(x) + min(x, y)")
+    report = engine.compilation_report()
+    print(report)
+    assert "原始 AST 树" in report
+    assert "常量折叠后 AST 树" in report
+    assert "公共子表达式" in report
+    assert "最终栈式指令序列" in report
+    assert "__temp_" in report
+    print("✓ 编译报告包含全部 5 个阶段")
+
+    print("\n--- 测试 17: 性能对比 ---")
     expr_complex = ("(x + y) * (x + y) + sin(x + y) * cos(x + y) + "
-                   "sqrt(x + y + 1) * log(x + y + 2) + exp(x + y)")
+                   "sqrt(x + y + 1) * log(x + y + 2) + exp(x + y) + min(x, y) + floor(x)")
     engine = ExpressionEngine(expr_complex)
 
     N = 100000
